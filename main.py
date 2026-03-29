@@ -42,6 +42,30 @@ except ImportError:
 # ══════════════════════════════════════════════
 BOT_TOKEN        = os.environ.get('BOT_TOKEN', '')
 GROQ_API_KEY     = os.environ.get('GROQ_API_KEY', '')
+
+# ── Multiple Groq API Keys (rotation) ──
+# Render-এ GROQ_API_KEY_1, GROQ_API_KEY_2, ... set করো
+_groq_keys = []
+if GROQ_API_KEY:
+    _groq_keys.append(GROQ_API_KEY)
+for _i in range(1, 20):
+    _k = os.environ.get(f'GROQ_API_KEY_{_i}', '')
+    if _k and _k not in _groq_keys:
+        _groq_keys.append(_k)
+if not _groq_keys:
+    _groq_keys = ['dummy_key']
+
+# ── Multiple Groq API Keys (rotation) ──
+# Render-এ GROQ_API_KEY_1, GROQ_API_KEY_2, ... set করো
+_groq_keys = []
+if GROQ_API_KEY:
+    _groq_keys.append(GROQ_API_KEY)
+for _i in range(1, 20):
+    _k = os.environ.get(f'GROQ_API_KEY_{_i}', '')
+    if _k and _k not in _groq_keys:
+        _groq_keys.append(_k)
+if not _groq_keys:
+    _groq_keys = ['dummy_key']  # will fail gracefully later
 CHANNEL_USERNAME = os.environ.get('CHANNEL_USERNAME', '@your_channel')
 RENDER_URL       = os.environ.get('RENDER_URL', '')
 SUBDL_API_KEY    = os.environ.get('SUBDL_API_KEY', '')
@@ -94,8 +118,66 @@ MAX_VIDEO_SIZE  = 50 * 1024 * 1024   # 50MB Telegram limit
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-groq_client   = Groq(api_key=GROQ_API_KEY)
-executor      = ThreadPoolExecutor(max_workers=8)
+# ══════════════════════════════════════════════
+# 🔄  GROQ KEY MANAGER — auto-rotate on quota/rate limit
+# ══════════════════════════════════════════════
+class _GroqManager:
+    def __init__(self, keys):
+        self._clients = [Groq(api_key=k) for k in keys]
+        self._idx     = 0
+        self._lock    = threading.Lock()
+        logger.info(f"✅ Groq keys loaded: {len(self._clients)}টি")
+
+    def client(self):
+        return self._clients[self._idx]
+
+    def rotate(self):
+        with self._lock:
+            old = self._idx
+            self._idx = (self._idx + 1) % len(self._clients)
+            logger.warning(f"🔄 Groq key #{old+1} শেষ — #{self._idx+1}-এ switch করা হয়েছে")
+        return self._clients[self._idx]
+
+    def call(self, **kwargs):
+        """Groq API call করো — quota/rate limit হলে auto-rotate করো"""
+        tried = 0
+        total = len(self._clients)
+        while tried < total:
+            try:
+                return self.client().chat.completions.create(**kwargs)
+            except Exception as e:
+                es = str(e)
+                if ('quota' in es.lower() or 'limit exceeded' in es.lower()
+                        or '402' in es or 'billing' in es.lower()):
+                    # Quota শেষ — পরের key-তে যাও
+                    self.rotate()
+                    tried += 1
+                    if tried >= total:
+                        raise Exception("QUOTA_EXCEEDED")
+                    continue
+                raise  # অন্য error হলে re-raise
+
+    def transcribe(self, **kwargs):
+        """Whisper transcription — quota হলে auto-rotate"""
+        tried = 0
+        total = len(self._clients)
+        while tried < total:
+            try:
+                return self.client().audio.transcriptions.create(**kwargs)
+            except Exception as e:
+                es = str(e)
+                if ('quota' in es.lower() or 'limit exceeded' in es.lower()
+                        or '402' in es or 'billing' in es.lower()):
+                    self.rotate()
+                    tried += 1
+                    if tried >= total:
+                        raise Exception("QUOTA_EXCEEDED")
+                    continue
+                raise
+
+groq_manager  = _GroqManager(_groq_keys)
+groq_client   = groq_manager   # backward compat alias — পুরনো code কাজ করবে
+executor      = ThreadPoolExecutor(max_workers=16)  # বেশি user একসাথে handle করতে পারবে
 active_tasks  = {}
 cancel_events = {}
 chat_mode     = {}
@@ -428,25 +510,34 @@ def _tsys(fl, tl):
             f"- Return ONLY the translation, nothing else")
 
 def t1(text, fl='auto', tl='bn', ce=None):
-    for _ in range(3):
+    """Single line translate — cancel event check করে"""
+    for attempt in range(3):
         if ce and ce.is_set(): return text
         try:
-            r = groq_client.chat.completions.create(
+            r = groq_manager.call(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role":"system","content":_tsys(fl,tl)},
                           {"role":"user","content":f"Translate:\n{text}"}],
-                temperature=0.15, max_tokens=256)
+                temperature=0.15, max_tokens=256,
+                timeout=45)
+            if ce and ce.is_set(): return text
             return r.choices[0].message.content.strip()
         except Exception as e:
-            if _iq(e): raise Exception("QUOTA_EXCEEDED")
+            if ce and ce.is_set(): return text
+            es = str(e)
+            if 'QUOTA_EXCEEDED' in es or _iq(e): raise Exception("QUOTA_EXCEEDED")
             elif _ir(e):
-                for _ in range(60):
+                for _ in range(30):
                     if ce and ce.is_set(): return text
                     time.sleep(1)
-            else: time.sleep(3)
+            else:
+                for _ in range(6):
+                    if ce and ce.is_set(): return text
+                    time.sleep(0.5)
     return text
 
 def tbatch(texts, fl='auto', tl='bn', ce=None):
+    """Batch translate — cancel event check করে প্রতিটি ধাপে"""
     if ce and ce.is_set(): return texts
     numbered = '\n'.join(f"[{i+1}] {t}" for i,t in enumerate(texts))
     msg = (f"Translate the following {len(texts)} subtitle lines.\n"
@@ -455,23 +546,30 @@ def tbatch(texts, fl='auto', tl='bn', ce=None):
     for att in range(3):
         if ce and ce.is_set(): return texts
         try:
-            resp = groq_client.chat.completions.create(
+            resp = groq_manager.call(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role":"system","content":_tsys(fl,tl)},
                           {"role":"user","content":msg}],
-                temperature=0.15, max_tokens=3000)
+                temperature=0.15, max_tokens=3000,
+                timeout=60)
+            if ce and ce.is_set(): return texts
             raw = resp.choices[0].message.content.strip()
             for m in re.finditer(r'\[(\d+)\]\s*(.*?)(?=\[\d+\]|\Z)',raw,re.DOTALL):
                 idx=int(m.group(1))-1; val=m.group(2).strip()
                 if 0<=idx<len(texts) and val: translated[idx]=val
             break
         except Exception as e:
-            if _iq(e): raise Exception("QUOTA_EXCEEDED")
+            if ce and ce.is_set(): return texts
+            es = str(e)
+            if 'QUOTA_EXCEEDED' in es or _iq(e): raise Exception("QUOTA_EXCEEDED")
             elif _ir(e):
-                for _ in range(60):
+                for _ in range(30):
                     if ce and ce.is_set(): return texts
                     time.sleep(1)
-            else: time.sleep(5)
+            else:
+                for _ in range(10):
+                    if ce and ce.is_set(): return texts
+                    time.sleep(0.5)
     for i,v in enumerate(translated):
         if v is None:
             if ce and ce.is_set(): return texts
@@ -487,20 +585,24 @@ def transcribe(audio_bytes, filename, language='en'):
         tmp.write(audio_bytes); tmp_path = tmp.name
     try:
         with open(tmp_path,'rb') as f:
-            params = dict(file=(filename,f,'audio/mpeg'),
+            params = dict(file=(filename, f, 'audio/mpeg'),
                           model="whisper-large-v3-turbo",
                           response_format="text", temperature=0.0)
             if language != 'auto': params['language'] = language
-            r = groq_client.audio.transcriptions.create(**params)
-        return r.strip() if isinstance(r,str) else r.text.strip()
+            # groq_manager.transcribe — quota হলে auto-rotate করে
+            r = groq_manager.transcribe(**params)
+        return r.strip() if isinstance(r, str) else r.text.strip()
     except Exception as e:
-        if _iq(e): raise Exception("QUOTA_EXCEEDED")
+        es = str(e)
+        if 'QUOTA_EXCEEDED' in es or _iq(e): raise Exception("QUOTA_EXCEEDED")
         raise e
-    finally: os.unlink(tmp_path)
+    finally:
+        try: os.unlink(tmp_path)
+        except: pass
 
 def trans_plain(text, tl='bn'):
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role":"system","content":(
@@ -653,7 +755,7 @@ def yt_subtitle(url, lang='en'):
 # ══════════════════════════════════════════════
 def fix_movie_name(query: str) -> str:
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role":"system","content":(
@@ -849,7 +951,7 @@ def ai_chat(uid, text):
     chat_history[uid].append({"role":"user","content":text})
     if len(chat_history[uid])>20: chat_history[uid]=chat_history[uid][-20:]
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[{"role":"system","content":CHAT_SYS}]+chat_history[uid],
             temperature=0.7, max_tokens=1024)
@@ -1272,17 +1374,30 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if d.startswith("cancel_"):
-        await q.answer()
-        target = int(d.split("_")[1])
-        if uid==target and uid in active_tasks:
+        await q.answer("❌ বাতিল করা হচ্ছে...", show_alert=False)
+        try:
+            target = int(d.split("_")[1])
+        except Exception:
+            return
+        if uid == target:
+            # cancel_event set করো — thread যত তাড়াতাড়ি পারে বের হয়ে যাবে
+            if uid in cancel_events:
+                cancel_events[uid].set()
             active_tasks[uid] = True
-            if uid in cancel_events: cancel_events[uid].set()
+            # UI update করো
             try:
                 await q.edit_message_caption(
-                    caption="❌ *বাতিল!* নতুন ফাইল পাঠাও।",
+                    caption="❌ *অনুবাদ বাতিল করা হয়েছে।*\n\nনতুন ফাইল পাঠাও।",
                     parse_mode='Markdown', reply_markup=kb_home())
-            except: pass
-        else: await q.answer("কোনো সক্রিয় কাজ নেই!", show_alert=True)
+            except Exception:
+                try:
+                    await q.edit_message_text(
+                        "❌ *অনুবাদ বাতিল করা হয়েছে।*\n\nনতুন ফাইল পাঠাও।",
+                        parse_mode='Markdown', reply_markup=kb_home())
+                except Exception:
+                    pass
+        else:
+            await q.answer("এটা তোমার কাজ নয়!", show_alert=True)
         return
 
     # ── Audio ──
@@ -1945,25 +2060,32 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         BATCH = 7; translated = list(blocks); completed = 0; loop = asyncio.get_event_loop()
         for i in range(0, total, BATCH):
-            if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
+            # ── Cancel check — loop শুরুতে ──
+            if ce.is_set() or active_tasks.get(u.id, False):
+                add_tokens(u.id, cost); return
             chunk  = blocks[i:i+BATCH]; texts = [b['text'] for b in chunk]
-            result = await loop.run_in_executor(executor, functools.partial(tbatch,texts,fl,tl,ce))
-            if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
-            for j,tr in enumerate(result):
-                if i+j<total: translated[i+j]['text']=tr
-            completed = min(i+BATCH,total); pct = completed/total*100
+            # executor-এ run করো — অন্য user-দের block করবে না
+            result = await loop.run_in_executor(
+                executor, functools.partial(tbatch, texts, fl, tl, ce))
+            # ── Cancel check — API call শেষে ──
+            if ce.is_set() or active_tasks.get(u.id, False):
+                add_tokens(u.id, cost); return
+            for j, tr in enumerate(result):
+                if i+j < total: translated[i+j]['text'] = tr
+            completed = min(i+BATCH, total); pct = completed/total*100
             bar = '█'*int(pct/5)+'░'*(20-int(pct/5))
             try:
                 await status.edit_media(InputMediaPhoto(
-                    media=pie_chart(completed,total),
+                    media=pie_chart(completed, total),
                     caption=(f"🔄 *অনুবাদ চলছে...*\n\n📁 `{doc.file_name}`\n"
                              f"`[{bar}]` *{pct:.1f}%*\n🌐 {lang_disp}\n"
                              f"━━━━━━━━━━━━━━━━━━━━━\n✅ {completed}/{total}"),
                     parse_mode='Markdown'), reply_markup=kb_cancel(u.id))
             except Exception as e: logger.warning(f"Edit ignored: {e}")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)  # একটু কম sleep — cancel দ্রুত detect হবে
 
-        if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
+        if ce.is_set() or active_tasks.get(u.id, False):
+            add_tokens(u.id, cost); return
 
         out   = build_srt(translated).encode('utf-8-sig')
         oname = re.sub(r'\.(srt|vtt|ass|ssa)$','_Bengali.srt',doc.file_name,flags=re.IGNORECASE)
@@ -2429,7 +2551,7 @@ def calc_read_time(text: str) -> float:
 
 def is_obscene_sync(text: str) -> bool:
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": OBSCENE_SYSTEM},
@@ -2473,7 +2595,7 @@ def group_ai_reply_sync(chat_id: int, user_id: int,
         )
 
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": sys_prompt}]
                      + group_history[chat_id],
@@ -2507,7 +2629,7 @@ def check_forgiveness_sync(user_id: int, user_name: str,
         f"Their apology: {apology_text}"
     )
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": forgive_sys},
@@ -2593,7 +2715,7 @@ def detect_user_request_sync(text: str) -> dict:
     """User-এর request/complaint detect করো"""
     import json
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": REQUEST_DETECT_SYSTEM},
@@ -2618,7 +2740,7 @@ def verify_complaint_sync(complaint_text: str, history: list) -> dict:
         f"Complaint: {complaint_text}"
     )
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": COMPLAINT_VERIFY_SYSTEM},
@@ -2907,7 +3029,7 @@ def owner_ai_parse_sync(owner_id: int, command_text: str) -> dict:
         owner_chat_history[owner_id] = owner_chat_history[owner_id][-MAX_OWNER_HIST:]
 
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": OWNER_AI_SYSTEM}]
                      + owner_chat_history[owner_id],
@@ -3148,7 +3270,7 @@ def kicked_ai_chat_sync(user_id: int, user_name: str, text: str, admin_link: str
 
     sys = KICKED_AI_SYSTEM + f" Group admin-এর link: {admin_link}"
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_manager.call(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": sys}]
                      + kicked_user_chat_history[user_id],

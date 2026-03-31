@@ -43,29 +43,16 @@ except ImportError:
 BOT_TOKEN        = os.environ.get('BOT_TOKEN', '')
 GROQ_API_KEY     = os.environ.get('GROQ_API_KEY', '')
 
-# ── Multiple Groq API Keys (rotation) ──
-# Render-এ GROQ_API_KEY_1, GROQ_API_KEY_2, ... set করো
+# ── Multiple Groq Keys (GROQ_API_KEY_1, _2, ... পর্যন্ত auto-load)
 _groq_keys = []
-if GROQ_API_KEY:
-    _groq_keys.append(GROQ_API_KEY)
+if os.environ.get('GROQ_API_KEY',''):
+    _groq_keys.append(os.environ['GROQ_API_KEY'])
 for _i in range(1, 20):
     _k = os.environ.get(f'GROQ_API_KEY_{_i}', '')
     if _k and _k not in _groq_keys:
         _groq_keys.append(_k)
 if not _groq_keys:
     _groq_keys = ['dummy_key']
-
-# ── Multiple Groq API Keys (rotation) ──
-# Render-এ GROQ_API_KEY_1, GROQ_API_KEY_2, ... set করো
-_groq_keys = []
-if GROQ_API_KEY:
-    _groq_keys.append(GROQ_API_KEY)
-for _i in range(1, 20):
-    _k = os.environ.get(f'GROQ_API_KEY_{_i}', '')
-    if _k and _k not in _groq_keys:
-        _groq_keys.append(_k)
-if not _groq_keys:
-    _groq_keys = ['dummy_key']  # will fail gracefully later
 CHANNEL_USERNAME = os.environ.get('CHANNEL_USERNAME', '@your_channel')
 RENDER_URL       = os.environ.get('RENDER_URL', '')
 SUBDL_API_KEY    = os.environ.get('SUBDL_API_KEY', '')
@@ -119,65 +106,57 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=lo
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════
-# 🔄  GROQ KEY MANAGER — auto-rotate on quota/rate limit
+# 🔄  GROQ KEY MANAGER
 # ══════════════════════════════════════════════
 class _GroqManager:
     def __init__(self, keys):
         self._clients = [Groq(api_key=k) for k in keys]
         self._idx     = 0
         self._lock    = threading.Lock()
-        logger.info(f"✅ Groq keys loaded: {len(self._clients)}টি")
+        logger.info(f"✅ Groq keys: {len(self._clients)}টি")
 
     def client(self):
         return self._clients[self._idx]
 
     def rotate(self):
         with self._lock:
-            old = self._idx
             self._idx = (self._idx + 1) % len(self._clients)
-            logger.warning(f"🔄 Groq key #{old+1} শেষ — #{self._idx+1}-এ switch করা হয়েছে")
+            logger.warning(f"🔄 Groq key #{self._idx+1}-এ switch")
         return self._clients[self._idx]
 
     def call(self, **kwargs):
-        """Groq API call করো — quota/rate limit হলে auto-rotate করো"""
         tried = 0
-        total = len(self._clients)
-        while tried < total:
+        while tried < len(self._clients):
             try:
                 return self.client().chat.completions.create(**kwargs)
             except Exception as e:
-                es = str(e)
-                if ('quota' in es.lower() or 'limit exceeded' in es.lower()
-                        or '402' in es or 'billing' in es.lower()):
-                    # Quota শেষ — পরের key-তে যাও
-                    self.rotate()
-                    tried += 1
-                    if tried >= total:
-                        raise Exception("QUOTA_EXCEEDED")
-                    continue
-                raise  # অন্য error হলে re-raise
-
-    def transcribe(self, **kwargs):
-        """Whisper transcription — quota হলে auto-rotate"""
-        tried = 0
-        total = len(self._clients)
-        while tried < total:
-            try:
-                return self.client().audio.transcriptions.create(**kwargs)
-            except Exception as e:
-                es = str(e)
-                if ('quota' in es.lower() or 'limit exceeded' in es.lower()
-                        or '402' in es or 'billing' in es.lower()):
-                    self.rotate()
-                    tried += 1
-                    if tried >= total:
+                es = str(e).lower()
+                if any(x in es for x in ['quota','limit exceeded','402','billing']):
+                    self.rotate(); tried += 1
+                    if tried >= len(self._clients):
                         raise Exception("QUOTA_EXCEEDED")
                     continue
                 raise
+        raise Exception("QUOTA_EXCEEDED")
+
+    def transcribe(self, **kwargs):
+        tried = 0
+        while tried < len(self._clients):
+            try:
+                return self.client().audio.transcriptions.create(**kwargs)
+            except Exception as e:
+                es = str(e).lower()
+                if any(x in es for x in ['quota','limit exceeded','402','billing']):
+                    self.rotate(); tried += 1
+                    if tried >= len(self._clients):
+                        raise Exception("QUOTA_EXCEEDED")
+                    continue
+                raise
+        raise Exception("QUOTA_EXCEEDED")
 
 groq_manager  = _GroqManager(_groq_keys)
-groq_client   = groq_manager   # backward compat alias — পুরনো code কাজ করবে
-executor      = ThreadPoolExecutor(max_workers=16)  # বেশি user একসাথে handle করতে পারবে
+groq_client   = groq_manager
+executor      = ThreadPoolExecutor(max_workers=16)
 active_tasks  = {}
 cancel_events = {}
 chat_mode     = {}
@@ -510,7 +489,6 @@ def _tsys(fl, tl):
             f"- Return ONLY the translation, nothing else")
 
 def t1(text, fl='auto', tl='bn', ce=None):
-    """Single line translate — cancel event check করে"""
     for attempt in range(3):
         if ce and ce.is_set(): return text
         try:
@@ -518,8 +496,7 @@ def t1(text, fl='auto', tl='bn', ce=None):
                 model="llama-3.3-70b-versatile",
                 messages=[{"role":"system","content":_tsys(fl,tl)},
                           {"role":"user","content":f"Translate:\n{text}"}],
-                temperature=0.15, max_tokens=256,
-                timeout=45)
+                temperature=0.15, max_tokens=256, timeout=45)
             if ce and ce.is_set(): return text
             return r.choices[0].message.content.strip()
         except Exception as e:
@@ -537,7 +514,6 @@ def t1(text, fl='auto', tl='bn', ce=None):
     return text
 
 def tbatch(texts, fl='auto', tl='bn', ce=None):
-    """Batch translate — cancel event check করে প্রতিটি ধাপে"""
     if ce and ce.is_set(): return texts
     numbered = '\n'.join(f"[{i+1}] {t}" for i,t in enumerate(texts))
     msg = (f"Translate the following {len(texts)} subtitle lines.\n"
@@ -550,8 +526,7 @@ def tbatch(texts, fl='auto', tl='bn', ce=None):
                 model="llama-3.3-70b-versatile",
                 messages=[{"role":"system","content":_tsys(fl,tl)},
                           {"role":"user","content":msg}],
-                temperature=0.15, max_tokens=3000,
-                timeout=60)
+                temperature=0.15, max_tokens=3000, timeout=60)
             if ce and ce.is_set(): return texts
             raw = resp.choices[0].message.content.strip()
             for m in re.finditer(r'\[(\d+)\]\s*(.*?)(?=\[\d+\]|\Z)',raw,re.DOTALL):
@@ -585,20 +560,16 @@ def transcribe(audio_bytes, filename, language='en'):
         tmp.write(audio_bytes); tmp_path = tmp.name
     try:
         with open(tmp_path,'rb') as f:
-            params = dict(file=(filename, f, 'audio/mpeg'),
+            params = dict(file=(filename,f,'audio/mpeg'),
                           model="whisper-large-v3-turbo",
                           response_format="text", temperature=0.0)
             if language != 'auto': params['language'] = language
-            # groq_manager.transcribe — quota হলে auto-rotate করে
             r = groq_manager.transcribe(**params)
-        return r.strip() if isinstance(r, str) else r.text.strip()
+        return r.strip() if isinstance(r,str) else r.text.strip()
     except Exception as e:
-        es = str(e)
-        if 'QUOTA_EXCEEDED' in es or _iq(e): raise Exception("QUOTA_EXCEEDED")
+        if _iq(e): raise Exception("QUOTA_EXCEEDED")
         raise e
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
+    finally: os.unlink(tmp_path)
 
 def trans_plain(text, tl='bn'):
     try:
@@ -1380,11 +1351,9 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             return
         if uid == target:
-            # cancel_event set করো — thread যত তাড়াতাড়ি পারে বের হয়ে যাবে
             if uid in cancel_events:
                 cancel_events[uid].set()
             active_tasks[uid] = True
-            # UI update করো
             try:
                 await q.edit_message_caption(
                     caption="❌ *অনুবাদ বাতিল করা হয়েছে।*\n\nনতুন ফাইল পাঠাও।",
@@ -2060,32 +2029,25 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         BATCH = 7; translated = list(blocks); completed = 0; loop = asyncio.get_event_loop()
         for i in range(0, total, BATCH):
-            # ── Cancel check — loop শুরুতে ──
-            if ce.is_set() or active_tasks.get(u.id, False):
-                add_tokens(u.id, cost); return
+            if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
             chunk  = blocks[i:i+BATCH]; texts = [b['text'] for b in chunk]
-            # executor-এ run করো — অন্য user-দের block করবে না
-            result = await loop.run_in_executor(
-                executor, functools.partial(tbatch, texts, fl, tl, ce))
-            # ── Cancel check — API call শেষে ──
-            if ce.is_set() or active_tasks.get(u.id, False):
-                add_tokens(u.id, cost); return
-            for j, tr in enumerate(result):
-                if i+j < total: translated[i+j]['text'] = tr
-            completed = min(i+BATCH, total); pct = completed/total*100
+            result = await loop.run_in_executor(executor, functools.partial(tbatch,texts,fl,tl,ce))
+            if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
+            for j,tr in enumerate(result):
+                if i+j<total: translated[i+j]['text']=tr
+            completed = min(i+BATCH,total); pct = completed/total*100
             bar = '█'*int(pct/5)+'░'*(20-int(pct/5))
             try:
                 await status.edit_media(InputMediaPhoto(
-                    media=pie_chart(completed, total),
+                    media=pie_chart(completed,total),
                     caption=(f"🔄 *অনুবাদ চলছে...*\n\n📁 `{doc.file_name}`\n"
                              f"`[{bar}]` *{pct:.1f}%*\n🌐 {lang_disp}\n"
                              f"━━━━━━━━━━━━━━━━━━━━━\n✅ {completed}/{total}"),
                     parse_mode='Markdown'), reply_markup=kb_cancel(u.id))
             except Exception as e: logger.warning(f"Edit ignored: {e}")
-            await asyncio.sleep(0.1)  # একটু কম sleep — cancel দ্রুত detect হবে
+            await asyncio.sleep(0.2)
 
-        if ce.is_set() or active_tasks.get(u.id, False):
-            add_tokens(u.id, cost); return
+        if ce.is_set() or active_tasks.get(u.id,False): add_tokens(u.id,cost); return
 
         out   = build_srt(translated).encode('utf-8-sig')
         oname = re.sub(r'\.(srt|vtt|ass|ssa)$','_Bengali.srt',doc.file_name,flags=re.IGNORECASE)
@@ -2564,28 +2526,38 @@ def is_obscene_sync(text: str) -> bool:
         return False
 
 
+# প্রতি group-এর last API call time — rate limit cooldown
+_group_last_call = {}   # {chat_id: float}
+GROUP_COOLDOWN   = 2.0  # সেকেন্ড — একই গ্রুপে এত কম সময়ে দুটো reply নয়
+
 def group_ai_reply_sync(chat_id: int, user_id: int,
                          user_name: str, text: str,
                          group_name: str = "গ্রুপ") -> str:
     """
     গ্রুপের shared history ব্যবহার করে AI reply দাও।
-    সবার কথোপকথন একসাথে থাকে — bot জানে কে কী বলেছে।
+    - Error message কখনো chat-এ পাঠায় না (return "")
+    - API-তে last 20টি message পাঠায় (token কম লাগে)
+    - Rate limit হলে silent retry করে
+    - Cooldown: একই গ্রুপে GROUP_COOLDOWN সেকেন্ডের মধ্যে reply নয়
     """
-    # Shared history — chat_id দিয়ে (user_id নয়)
+    # ── Cooldown check ──
+    now = time.time()
+    last = _group_last_call.get(chat_id, 0)
+    if now - last < GROUP_COOLDOWN:
+        return ""   # too soon — silently skip
+
+    # Shared history
     if chat_id not in group_history:
         group_history[chat_id] = []
 
-    # "Name: message" ফরম্যাটে রাখো যাতে bot জানে কে বলেছে
     group_history[chat_id].append({
         "role": "user",
         "content": f"{user_name}: {text}"
     })
-
-    # Max history বজায় রাখো
     if len(group_history[chat_id]) > MAX_GROUP_HIST:
         group_history[chat_id] = group_history[chat_id][-MAX_GROUP_HIST:]
 
-    # Warn context যোগ করো system prompt-এ
+    # Warn context
     key   = (chat_id, user_id)
     warns = warn_reasons.get(key, [])
     sys_prompt = GROUP_AI_SYSTEM.replace('{group_name}', group_name)
@@ -2594,19 +2566,40 @@ def group_ai_reply_sync(chat_id: int, user_id: int,
             f" বিশেষ দ্রষ্টব্য: {user_name} কে আগে সতর্ক করা হয়েছিল কারণ: {', '.join(warns[-3:])}।"
         )
 
-    try:
-        resp = groq_manager.call(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": sys_prompt}]
-                     + group_history[chat_id],
-            temperature=0.7, max_tokens=512)
-        reply = resp.choices[0].message.content.strip()
-        # AI reply-ও shared history-তে রাখো
-        group_history[chat_id].append({"role": "assistant", "content": reply})
-        return reply
-    except Exception as e:
-        if _iq(e): return "⚠️ API limit শেষ।"
-        return ""
+    # API-তে শুধু last 20টি message পাঠাও (token বাঁচাও)
+    history_to_send = group_history[chat_id][-20:]
+
+    for attempt in range(2):   # rate limit হলে একবার retry
+        try:
+            _group_last_call[chat_id] = time.time()
+            resp = groq_manager.call(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "system", "content": sys_prompt}]
+                         + history_to_send,
+                temperature=0.7, max_tokens=300,
+                timeout=30)
+            reply = resp.choices[0].message.content.strip()
+            # ── Error message chat-এ যাওয়া ঠেকাও ──
+            if not reply or len(reply) < 2:
+                return ""
+            group_history[chat_id].append({"role": "assistant", "content": reply})
+            return reply
+        except Exception as e:
+            es = str(e)
+            if 'QUOTA_EXCEEDED' in es or _iq(e):
+                # সব key শেষ — silently fail, error message chat-এ নয়
+                logger.warning(f"Group {chat_id}: all Groq keys exhausted")
+                return ""
+            elif _ir(e):
+                # Rate limit — একটু wait করে retry
+                if attempt == 0:
+                    time.sleep(3)
+                    continue
+                return ""
+            else:
+                logger.warning(f"Group AI error {chat_id}: {es[:80]}")
+                return ""
+    return ""
 
 
 def check_forgiveness_sync(user_id: int, user_name: str,
